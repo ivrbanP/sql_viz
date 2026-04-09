@@ -1,0 +1,873 @@
+/**
+ * SQL Parser - Extracts table relationships from SQL queries.
+ * Handles: SELECT, INSERT, CREATE VIEW, UPDATE, DELETE, CTEs, subqueries.
+ */
+class SQLParser {
+  constructor() {
+    this.subqueryCount = 0;
+    this.aliasMap = new Map(); // alias (lower) -> table name (lower)
+  }
+
+  parse(sql) {
+    this.subqueryCount = 0;
+    this.aliasMap = new Map();
+
+    sql = this.removeComments(sql);
+    const statements = this.splitStatements(sql);
+    const nodeMap = new Map();
+    const edges = [];
+
+    for (const stmt of statements) {
+      const trimmed = stmt.trim();
+      if (trimmed) {
+        this.analyzeStatement(trimmed, nodeMap, edges);
+      }
+    }
+
+    // Post-process: scan full SQL for WHERE-clause join conditions
+    this.analyzeWhereConditions(sql, nodeMap, edges);
+
+    // Post-process: extract column references from the SQL
+    this.extractColumns(sql, nodeMap);
+
+    return {
+      nodes: Array.from(nodeMap.values()),
+      edges: this.deduplicateEdges(edges)
+    };
+  }
+
+  // ── Preprocessing ──────────────────────────────────────────────
+
+  removeComments(sql) {
+    return sql
+      .replace(/--[^\n]*/g, '')
+      .replace(/\/\*[\s\S]*?\*\//g, '');
+  }
+
+  splitStatements(sql) {
+    const stmts = [];
+    let current = '';
+    let inQ = false, qChar = '';
+    let depth = 0;
+
+    for (let i = 0; i < sql.length; i++) {
+      const ch = sql[i];
+      if (inQ) {
+        current += ch;
+        if (ch === qChar && sql[i + 1] === qChar) { current += qChar; i++; }
+        else if (ch === qChar) inQ = false;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === '`') { inQ = true; qChar = ch; current += ch; }
+      else if (ch === '(') { depth++; current += ch; }
+      else if (ch === ')') { depth = Math.max(0, depth - 1); current += ch; }
+      else if (ch === ';' && depth === 0) { if (current.trim()) stmts.push(current.trim()); current = ''; }
+      else current += ch;
+    }
+    if (current.trim()) stmts.push(current.trim());
+    return stmts;
+  }
+
+  // ── Tokenizer ──────────────────────────────────────────────────
+
+  tokenize(sql) {
+    const tokens = [];
+    let i = 0;
+    const len = sql.length;
+
+    while (i < len) {
+      if (/\s/.test(sql[i])) { i++; continue; }
+
+      // Single-quoted string
+      if (sql[i] === "'") {
+        let j = i + 1;
+        while (j < len) {
+          if (sql[j] === "'" && sql[j + 1] === "'") j += 2;
+          else if (sql[j] === "'") { j++; break; }
+          else j++;
+        }
+        tokens.push({ t: 'S', v: sql.slice(i, j), u: sql.slice(i, j).toUpperCase() });
+        i = j; continue;
+      }
+
+      // Quoted identifier
+      if (sql[i] === '"' || sql[i] === '`') {
+        const q = sql[i]; let j = i + 1;
+        while (j < len && sql[j] !== q) j++;
+        const val = sql.slice(i + 1, j);
+        j++;
+        tokens.push({ t: 'I', v: val, u: val.toUpperCase() });
+        i = j; continue;
+      }
+
+      // Bracket identifier [name]
+      if (sql[i] === '[') {
+        let j = i + 1;
+        while (j < len && sql[j] !== ']') j++;
+        const val = sql.slice(i + 1, j);
+        j++;
+        tokens.push({ t: 'I', v: val, u: val.toUpperCase() });
+        i = j; continue;
+      }
+
+      // Word
+      if (/[a-zA-Z_]/.test(sql[i])) {
+        let j = i;
+        while (j < len && /[a-zA-Z0-9_]/.test(sql[j])) j++;
+        const w = sql.slice(i, j);
+        tokens.push({ t: 'W', v: w, u: w.toUpperCase() });
+        i = j; continue;
+      }
+
+      // Number
+      if (/\d/.test(sql[i])) {
+        let j = i;
+        while (j < len && /[\d.eE]/.test(sql[j])) j++;
+        tokens.push({ t: 'N', v: sql.slice(i, j), u: '' });
+        i = j; continue;
+      }
+
+      // Symbol
+      tokens.push({ t: 'P', v: sql[i], u: sql[i] });
+      i++;
+    }
+    return tokens;
+  }
+
+  // ── Node helpers ───────────────────────────────────────────────
+
+  getOrCreateNode(nodeMap, rawName, type) {
+    const name = this.cleanName(rawName);
+    const key = name.toLowerCase();
+    if (!nodeMap.has(key)) {
+      nodeMap.set(key, { id: key, name: name, type: type || 'table', columns: [] });
+    }
+    const node = nodeMap.get(key);
+    // Upgrade type if more specific
+    if (type && type !== 'table' && node.type === 'table') node.type = type;
+    return node;
+  }
+
+  cleanName(name) {
+    return name.replace(/^["'`[\]]+|["'`[\]]+$/g, '');
+  }
+
+  addAlias(alias, tableName) {
+    if (alias) {
+      this.aliasMap.set(alias.toLowerCase(), tableName.toLowerCase());
+    }
+  }
+
+  resolveAlias(name) {
+    const lower = name.toLowerCase();
+    return this.aliasMap.get(lower) || lower;
+  }
+
+  // ── Statement dispatch ─────────────────────────────────────────
+
+  analyzeStatement(sql, nodeMap, edges) {
+    const tokens = this.tokenize(sql);
+    if (tokens.length === 0) return;
+
+    const first = tokens[0].u;
+
+    if (first === 'WITH') {
+      this.analyzeCTE(tokens, nodeMap, edges);
+    } else if (first === 'SELECT') {
+      this.analyzeSelect(tokens, 0, tokens.length, nodeMap, edges, null);
+    } else if (first === 'INSERT') {
+      this.analyzeInsert(tokens, nodeMap, edges);
+    } else if (first === 'CREATE') {
+      this.analyzeCreate(tokens, nodeMap, edges);
+    } else if (first === 'UPDATE') {
+      this.analyzeUpdate(tokens, nodeMap, edges);
+    } else if (first === 'DELETE') {
+      this.analyzeDelete(tokens, nodeMap, edges);
+    } else if (first === 'MERGE') {
+      this.analyzeMerge(tokens, nodeMap, edges);
+    }
+  }
+
+  // ── SELECT ─────────────────────────────────────────────────────
+
+  analyzeSelect(tokens, start, end, nodeMap, edges, targetId) {
+    // Handle UNION/EXCEPT/INTERSECT by splitting at depth 0
+    const parts = this.splitUnion(tokens, start, end);
+    const allTables = [];
+
+    for (const part of parts) {
+      const tables = this.analyzeSelectPart(tokens, part.start, part.end, nodeMap, edges, targetId);
+      allTables.push(...tables);
+    }
+    return allTables;
+  }
+
+  splitUnion(tokens, start, end) {
+    const parts = [];
+    let depth = 0;
+    let partStart = start;
+
+    for (let i = start; i < end; i++) {
+      if (tokens[i].v === '(') depth++;
+      if (tokens[i].v === ')') depth--;
+      if (depth === 0 && (tokens[i].u === 'UNION' || tokens[i].u === 'EXCEPT' || tokens[i].u === 'INTERSECT')) {
+        parts.push({ start: partStart, end: i });
+        // Skip ALL
+        i++;
+        if (i < end && tokens[i].u === 'ALL') i++;
+        partStart = i;
+      }
+    }
+    parts.push({ start: partStart, end: end });
+    return parts;
+  }
+
+  analyzeSelectPart(tokens, start, end, nodeMap, edges, targetId) {
+    const sourceTables = [];
+
+    // Find FROM at depth 0
+    let depth = 0;
+    let fromPos = -1;
+
+    for (let i = start; i < end; i++) {
+      if (tokens[i].v === '(') depth++;
+      if (tokens[i].v === ')') depth--;
+      if (depth === 0 && tokens[i].u === 'FROM') {
+        fromPos = i;
+        break;
+      }
+    }
+
+    if (fromPos === -1) return sourceTables;
+
+    // Find FROM clause end
+    const fromEnd = this.findFromClauseEnd(tokens, fromPos + 1, end);
+
+    // Parse FROM clause
+    let i = fromPos + 1;
+    let prevTable = null;
+    const sourceTableIds = new Set();
+
+    while (i < fromEnd) {
+      if (tokens[i].v === ',') { i++; continue; }
+
+      // Check for JOIN keywords
+      const joinMatch = this.matchJoin(tokens, i);
+      if (joinMatch.matched) {
+        i = joinMatch.nextPos;
+        const result = this.readTableOrSubquery(tokens, i, fromEnd, nodeMap, edges);
+        if (result) {
+          sourceTables.push(result.node);
+          i = result.nextPos;
+
+          // Read ON/USING condition
+          const cond = this.readJoinCondition(tokens, i, fromEnd);
+          i = cond.nextPos;
+
+          if (prevTable) {
+            // Determine actual join source from ON condition
+            let actualSource = prevTable.id;
+            if (cond.text) {
+              const refs = [...cond.text.matchAll(/\b(\w+)\s*\./g)].map(m => this.resolveAlias(m[1]));
+              const newId = result.node.id.toLowerCase();
+              const sourceRef = refs.find(r => r !== newId && sourceTableIds.has(r));
+              if (sourceRef) actualSource = sourceRef;
+            }
+
+            edges.push({
+              source: actualSource,
+              target: result.node.id,
+              type: 'join',
+              label: joinMatch.type,
+              condition: cond.text
+            });
+          }
+          sourceTableIds.add(result.node.id.toLowerCase());
+          prevTable = result.node;
+        }
+        continue;
+      }
+
+      // Regular table or subquery
+      const result = this.readTableOrSubquery(tokens, i, fromEnd, nodeMap, edges);
+      if (result) {
+        sourceTables.push(result.node);
+        sourceTableIds.add(result.node.id.toLowerCase());
+
+        // Track last table for possible subsequent JOIN
+        prevTable = result.node;
+        i = result.nextPos;
+      } else {
+        i++;
+      }
+    }
+
+    // Also scan for subqueries in WHERE/HAVING/SELECT clauses
+    this.scanSubqueries(tokens, start, fromPos, nodeMap, edges);
+    this.scanSubqueries(tokens, fromEnd, end, nodeMap, edges);
+
+    // Data flow edges to target
+    if (targetId) {
+      for (const table of sourceTables) {
+        edges.push({
+          source: table.id,
+          target: targetId,
+          type: 'data_flow',
+          label: '',
+          condition: ''
+        });
+      }
+    }
+
+    return sourceTables;
+  }
+
+  readTableOrSubquery(tokens, pos, limit, nodeMap, edges) {
+    if (pos >= limit) return null;
+
+    // Subquery: ( SELECT ... ) [AS] alias
+    if (tokens[pos].v === '(' && this.isSubquery(tokens, pos)) {
+      const closeP = this.findCloseParen(tokens, pos);
+      const subName = 'subquery_' + (++this.subqueryCount);
+      const subNode = this.getOrCreateNode(nodeMap, subName, 'subquery');
+
+      // Recursively analyze
+      this.analyzeSelect(tokens, pos + 1, closeP, nodeMap, edges, null);
+
+      let nextPos = closeP + 1;
+
+      // Read alias
+      if (nextPos < limit && tokens[nextPos].u === 'AS') nextPos++;
+      if (nextPos < limit && this.isIdentifier(tokens[nextPos])) {
+        const aliasName = tokens[nextPos].v;
+        // Rename the subquery node
+        nodeMap.delete(subName.toLowerCase());
+        subNode.name = aliasName;
+        subNode.id = aliasName.toLowerCase();
+        nodeMap.set(subNode.id, subNode);
+        this.addAlias(aliasName, subNode.id);
+        nextPos++;
+      }
+
+      return { node: subNode, nextPos };
+    }
+
+    // LATERAL subquery
+    if (tokens[pos].u === 'LATERAL') {
+      return this.readTableOrSubquery(tokens, pos + 1, limit, nodeMap, edges);
+    }
+
+    // Regular table: [schema.]table [AS] alias
+    const ref = this.readTableRef(tokens, pos);
+    if (ref) {
+      const node = this.getOrCreateNode(nodeMap, ref.name, 'table');
+      if (ref.alias) {
+        this.addAlias(ref.alias, ref.name);
+      }
+      return { node, nextPos: ref.nextPos };
+    }
+
+    return null;
+  }
+
+  readTableRef(tokens, pos) {
+    if (pos >= tokens.length) return null;
+    if (!this.isIdentifier(tokens[pos])) return null;
+
+    let name = tokens[pos].v;
+    let i = pos + 1;
+
+    // schema.table or catalog.schema.table
+    while (i + 1 < tokens.length && tokens[i].v === '.' && this.isIdentifier(tokens[i + 1])) {
+      name += '.' + tokens[i + 1].v;
+      i += 2;
+    }
+
+    // Alias
+    let alias = '';
+    if (i < tokens.length) {
+      if (tokens[i].u === 'AS' && i + 1 < tokens.length && this.isIdentifier(tokens[i + 1]) && !this.isKeyword(tokens[i + 1].u)) {
+        alias = tokens[i + 1].v;
+        i += 2;
+      } else if (this.isIdentifier(tokens[i]) && !this.isKeyword(tokens[i].u)) {
+        alias = tokens[i].v;
+        i++;
+      }
+    }
+
+    return { name, alias, nextPos: i };
+  }
+
+  matchJoin(tokens, pos) {
+    const modifiers = new Set(['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'NATURAL']);
+    let i = pos;
+    let type = '';
+
+    while (i < tokens.length && modifiers.has(tokens[i].u)) {
+      type += tokens[i].u + ' ';
+      i++;
+      if (i < tokens.length && tokens[i].u === 'OUTER') {
+        type += 'OUTER ';
+        i++;
+      }
+    }
+
+    if (i < tokens.length && tokens[i].u === 'JOIN') {
+      type = (type + 'JOIN').trim();
+      return { matched: true, type, nextPos: i + 1 };
+    }
+
+    if (pos < tokens.length && tokens[pos].u === 'JOIN') {
+      return { matched: true, type: 'JOIN', nextPos: pos + 1 };
+    }
+
+    return { matched: false };
+  }
+
+  readJoinCondition(tokens, pos, limit) {
+    let i = pos;
+
+    if (i < limit && tokens[i].u === 'ON') {
+      i++;
+      const condStart = i;
+      let depth = 0;
+      while (i < limit) {
+        if (tokens[i].v === '(') depth++;
+        if (tokens[i].v === ')') depth--;
+        if (depth === 0) {
+          if (tokens[i].v === ',') break;
+          const jm = this.matchJoin(tokens, i);
+          if (jm.matched) break;
+        }
+        i++;
+      }
+      return { text: tokens.slice(condStart, i).map(t => t.v).join(' '), nextPos: i };
+    }
+
+    if (i < limit && tokens[i].u === 'USING') {
+      i++;
+      if (i < limit && tokens[i].v === '(') {
+        const cp = this.findCloseParen(tokens, i);
+        const text = 'USING ' + tokens.slice(i, cp + 1).map(t => t.v).join(' ');
+        return { text, nextPos: cp + 1 };
+      }
+    }
+
+    return { text: '', nextPos: i };
+  }
+
+  findFromClauseEnd(tokens, start, end) {
+    let depth = 0;
+    const endKw = new Set(['WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'UNION', 'EXCEPT',
+      'INTERSECT', 'FETCH', 'OFFSET', 'WINDOW', 'FOR', 'INTO']);
+    for (let i = start; i < end; i++) {
+      if (tokens[i].v === '(') depth++;
+      if (tokens[i].v === ')') depth--;
+      if (depth === 0 && tokens[i].t === 'W' && endKw.has(tokens[i].u)) {
+        return i;
+      }
+    }
+    return end;
+  }
+
+  // ── INSERT ─────────────────────────────────────────────────────
+
+  analyzeInsert(tokens, nodeMap, edges) {
+    let i = 0;
+    if (tokens[i].u === 'INSERT') i++;
+    if (i < tokens.length && tokens[i].u === 'INTO') i++;
+
+    const ref = this.readTableRef(tokens, i);
+    if (!ref) return;
+
+    const targetNode = this.getOrCreateNode(nodeMap, ref.name, 'table');
+    i = ref.nextPos;
+
+    // Read column list
+    if (i < tokens.length && tokens[i].v === '(') {
+      const cp = this.findCloseParen(tokens, i);
+      const cols = [];
+      for (let j = i + 1; j < cp; j++) {
+        if (this.isIdentifier(tokens[j])) cols.push(tokens[j].v);
+      }
+      if (cols.length > 0) targetNode.columns = cols;
+      i = cp + 1;
+    }
+
+    // Skip OVERRIDING keyword etc
+    while (i < tokens.length && tokens[i].u !== 'SELECT' && tokens[i].u !== 'VALUES' && tokens[i].u !== 'WITH' && tokens[i].v !== '(') {
+      i++;
+    }
+
+    // SELECT or WITH
+    if (i < tokens.length && (tokens[i].u === 'SELECT' || tokens[i].u === 'WITH')) {
+      if (tokens[i].u === 'WITH') {
+        this.analyzeCTE(tokens.slice(i), nodeMap, edges, targetNode.id);
+      } else {
+        this.analyzeSelect(tokens, i, tokens.length, nodeMap, edges, targetNode.id);
+      }
+    }
+  }
+
+  // ── CREATE VIEW / TABLE AS ────────────────────────────────────
+
+  analyzeCreate(tokens, nodeMap, edges) {
+    let i = 1; // Skip CREATE
+    if (i < tokens.length && tokens[i].u === 'OR') { i++; if (i < tokens.length && tokens[i].u === 'REPLACE') i++; }
+    if (i < tokens.length && tokens[i].u === 'MATERIALIZED') i++;
+
+    if (i < tokens.length && tokens[i].u === 'VIEW') {
+      i++;
+      const ref = this.readTableRef(tokens, i);
+      if (!ref) return;
+      const viewNode = this.getOrCreateNode(nodeMap, ref.name, 'view');
+      i = ref.nextPos;
+
+      // Skip column list
+      if (i < tokens.length && tokens[i].v === '(') {
+        const cp = this.findCloseParen(tokens, i);
+        i = cp + 1;
+      }
+
+      while (i < tokens.length && tokens[i].u !== 'AS') i++;
+      if (i < tokens.length) i++;
+
+      if (i < tokens.length && (tokens[i].u === 'SELECT' || tokens[i].u === 'WITH')) {
+        if (tokens[i].u === 'WITH') {
+          this.analyzeCTE(tokens.slice(i), nodeMap, edges, viewNode.id);
+        } else {
+          this.analyzeSelect(tokens, i, tokens.length, nodeMap, edges, viewNode.id);
+        }
+      }
+    } else if (i < tokens.length && tokens[i].u === 'TABLE') {
+      i++;
+      if (i < tokens.length && tokens[i].u === 'IF') { while (i < tokens.length && tokens[i].u !== 'EXISTS') i++; i++; }
+      const ref = this.readTableRef(tokens, i);
+      if (!ref) return;
+      const tableNode = this.getOrCreateNode(nodeMap, ref.name, 'table');
+      i = ref.nextPos;
+
+      while (i < tokens.length && tokens[i].u !== 'AS') i++;
+      if (i < tokens.length) i++;
+      if (i < tokens.length && tokens[i].u === 'SELECT') {
+        this.analyzeSelect(tokens, i, tokens.length, nodeMap, edges, tableNode.id);
+      }
+    }
+  }
+
+  // ── UPDATE ─────────────────────────────────────────────────────
+
+  analyzeUpdate(tokens, nodeMap, edges) {
+    let i = 1;
+    const ref = this.readTableRef(tokens, i);
+    if (!ref) return;
+
+    const targetNode = this.getOrCreateNode(nodeMap, ref.name, 'table');
+    if (ref.alias) this.addAlias(ref.alias, ref.name);
+    i = ref.nextPos;
+
+    // Look for FROM at depth 0
+    let depth = 0;
+    for (let j = i; j < tokens.length; j++) {
+      if (tokens[j].v === '(') depth++;
+      if (tokens[j].v === ')') depth--;
+      if (depth === 0 && tokens[j].u === 'FROM') {
+        // Create a synthetic SELECT-like analysis starting at FROM
+        const fromTables = this.analyzeSelectPart(tokens, j, tokens.length, nodeMap, edges, null);
+        for (const t of fromTables) {
+          edges.push({
+            source: t.id,
+            target: targetNode.id,
+            type: 'data_flow',
+            label: 'UPDATE',
+            condition: ''
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  // ── DELETE ─────────────────────────────────────────────────────
+
+  analyzeDelete(tokens, nodeMap, edges) {
+    let i = 1;
+    if (i < tokens.length && tokens[i].u === 'FROM') i++;
+    const ref = this.readTableRef(tokens, i);
+    if (ref) {
+      this.getOrCreateNode(nodeMap, ref.name, 'table');
+      if (ref.alias) this.addAlias(ref.alias, ref.name);
+    }
+
+    // Check for USING clause (PostgreSQL)
+    let depth = 0;
+    for (let j = (ref ? ref.nextPos : i); j < tokens.length; j++) {
+      if (tokens[j].v === '(') depth++;
+      if (tokens[j].v === ')') depth--;
+      if (depth === 0 && tokens[j].u === 'USING') {
+        j++;
+        const uRef = this.readTableRef(tokens, j);
+        if (uRef && ref) {
+          const uNode = this.getOrCreateNode(nodeMap, uRef.name, 'table');
+          edges.push({
+            source: uNode.id,
+            target: nodeMap.get(ref.name.toLowerCase()).id,
+            type: 'join',
+            label: 'USING',
+            condition: ''
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  // ── MERGE ──────────────────────────────────────────────────────
+
+  analyzeMerge(tokens, nodeMap, edges) {
+    let i = 1;
+    if (i < tokens.length && tokens[i].u === 'INTO') i++;
+    const targetRef = this.readTableRef(tokens, i);
+    if (!targetRef) return;
+
+    const targetNode = this.getOrCreateNode(nodeMap, targetRef.name, 'table');
+    if (targetRef.alias) this.addAlias(targetRef.alias, targetRef.name);
+    i = targetRef.nextPos;
+
+    if (i < tokens.length && tokens[i].u === 'USING') {
+      i++;
+      const result = this.readTableOrSubquery(tokens, i, tokens.length, nodeMap, edges);
+      if (result) {
+        edges.push({
+          source: result.node.id,
+          target: targetNode.id,
+          type: 'data_flow',
+          label: 'MERGE',
+          condition: ''
+        });
+      }
+    }
+  }
+
+  // ── CTE (WITH) ────────────────────────────────────────────────
+
+  analyzeCTE(tokens, nodeMap, edges, outerTargetId) {
+    let i = 0;
+    if (tokens[i].u === 'WITH') i++;
+    if (i < tokens.length && tokens[i].u === 'RECURSIVE') i++;
+
+    // Parse CTEs
+    while (i < tokens.length) {
+      if (!this.isIdentifier(tokens[i])) break;
+
+      const cteName = tokens[i].v;
+      i++;
+
+      // Skip column list
+      if (i < tokens.length && tokens[i].v === '(') {
+        // Check if this is a column list or the AS query
+        // Column list: (col1, col2) followed by AS
+        // Need to check if after close paren we see AS
+        const cp = this.findCloseParen(tokens, i);
+        if (cp + 1 < tokens.length && tokens[cp + 1].u === 'AS') {
+          i = cp + 1;
+        }
+      }
+
+      if (i < tokens.length && tokens[i].u === 'AS') i++;
+
+      // Optional MATERIALIZED / NOT MATERIALIZED
+      if (i < tokens.length && tokens[i].u === 'NOT') i++;
+      if (i < tokens.length && tokens[i].u === 'MATERIALIZED') i++;
+
+      if (i < tokens.length && tokens[i].v === '(') {
+        const cp = this.findCloseParen(tokens, i);
+        const cteNode = this.getOrCreateNode(nodeMap, cteName, 'cte');
+        this.addAlias(cteName, cteName);
+
+        this.analyzeSelect(tokens, i + 1, cp, nodeMap, edges, cteNode.id);
+
+        i = cp + 1;
+      }
+
+      if (i < tokens.length && tokens[i].v === ',') { i++; continue; }
+      break;
+    }
+
+    // Main query after CTEs
+    if (i < tokens.length) {
+      const first = tokens[i].u;
+      const targetId = outerTargetId || null;
+
+      if (first === 'SELECT') {
+        this.analyzeSelect(tokens, i, tokens.length, nodeMap, edges, targetId);
+      } else if (first === 'INSERT') {
+        this.analyzeInsert(tokens.slice(i), nodeMap, edges);
+      } else if (first === 'UPDATE') {
+        this.analyzeUpdate(tokens.slice(i), nodeMap, edges);
+      } else if (first === 'DELETE') {
+        this.analyzeDelete(tokens.slice(i), nodeMap, edges);
+      }
+    }
+  }
+
+  // ── Subquery scanning ─────────────────────────────────────────
+
+  scanSubqueries(tokens, start, end, nodeMap, edges) {
+    for (let i = start; i < end; i++) {
+      if (tokens[i].v === '(' && this.isSubquery(tokens, i)) {
+        const cp = this.findCloseParen(tokens, i);
+        this.analyzeSelect(tokens, i + 1, cp, nodeMap, edges, null);
+        i = cp;
+      }
+    }
+  }
+
+  // ── WHERE condition analysis ──────────────────────────────────
+
+  analyzeWhereConditions(sql, nodeMap, edges) {
+    // Find patterns like alias.col = alias.col in WHERE/ON clauses
+    const pattern = /\b(\w+)\.(\w+)\s*(?:=|<>|!=|<=|>=|<|>)\s*(\w+)\.(\w+)\b/g;
+    let match;
+
+    while ((match = pattern.exec(sql)) !== null) {
+      const left = this.resolveAlias(match[1]);
+      const right = this.resolveAlias(match[3]);
+
+      if (left !== right && nodeMap.has(left) && nodeMap.has(right)) {
+        // Check if a join edge already exists between these two
+        const exists = edges.some(e =>
+          e.type === 'join' && (
+            (e.source === left && e.target === right) ||
+            (e.source === right && e.target === left)
+          )
+        );
+
+        if (!exists) {
+          edges.push({
+            source: left,
+            target: right,
+            type: 'where_join',
+            label: `${match[1]}.${match[2]} = ${match[3]}.${match[4]}`,
+            condition: `${match[1]}.${match[2]} = ${match[3]}.${match[4]}`
+          });
+        }
+      }
+    }
+  }
+
+  // ── Utilities ─────────────────────────────────────────────────
+
+  isSubquery(tokens, pos) {
+    if (pos + 1 < tokens.length && tokens[pos].v === '(') {
+      const next = tokens[pos + 1].u;
+      return next === 'SELECT' || next === 'WITH';
+    }
+    return false;
+  }
+
+  findCloseParen(tokens, openPos) {
+    let depth = 1;
+    for (let i = openPos + 1; i < tokens.length; i++) {
+      if (tokens[i].v === '(') depth++;
+      if (tokens[i].v === ')') { depth--; if (depth === 0) return i; }
+    }
+    return tokens.length - 1;
+  }
+
+  isIdentifier(token) {
+    return token && (token.t === 'W' || token.t === 'I');
+  }
+
+  isKeyword(word) {
+    const kw = new Set([
+      'SELECT', 'FROM', 'WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS',
+      'NATURAL', 'ON', 'AND', 'OR', 'NOT', 'IN', 'EXISTS', 'BETWEEN', 'LIKE', 'IS',
+      'NULL', 'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET',
+      'UNION', 'EXCEPT', 'INTERSECT', 'ALL', 'DISTINCT', 'INSERT', 'INTO', 'VALUES',
+      'UPDATE', 'SET', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'TABLE', 'VIEW', 'INDEX',
+      'WITH', 'AS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'CAST', 'OUTER',
+      'FETCH', 'WINDOW', 'PARTITION', 'ROWS', 'RANGE', 'OVER', 'USING', 'LATERAL',
+      'RECURSIVE', 'MATERIALIZED', 'REPLACE', 'TRUE', 'FALSE', 'TOP', 'MERGE',
+      'MATCHED', 'FOR', 'IF', 'GRANT', 'REVOKE', 'PRIMARY', 'KEY', 'FOREIGN',
+      'REFERENCES', 'CHECK', 'CONSTRAINT', 'DEFAULT', 'UNIQUE', 'TRIGGER',
+    ]);
+    return kw.has(word);
+  }
+
+  extractColumns(sql, nodeMap) {
+    // Collect qualified column refs: alias.column or table.column
+    const qualifiedPattern = /\b(\w+)\s*\.\s*(\w+)\b/g;
+    let match;
+    const columnsByTable = new Map();
+
+    // Aggregation / function names to exclude
+    const skipWords = new Set([
+      'count', 'sum', 'avg', 'min', 'max', 'coalesce', 'nullif',
+      'cast', 'convert', 'trim', 'upper', 'lower', 'length', 'substr',
+      'substring', 'replace', 'concat', 'round', 'floor', 'ceil',
+      'abs', 'now', 'date', 'year', 'month', 'day', 'extract',
+      'row_number', 'rank', 'dense_rank', 'lead', 'lag',
+      'first_value', 'last_value', 'ntile', 'string_agg', 'listagg',
+      'group_concat',
+    ]);
+
+    while ((match = qualifiedPattern.exec(sql)) !== null) {
+      const prefix = match[1];
+      const col = match[2];
+
+      if (skipWords.has(prefix.toLowerCase())) continue;
+      if (skipWords.has(col.toLowerCase())) continue;
+
+      // Skip pure numeric or wildcard
+      if (/^\d+$/.test(col) || col === '*') continue;
+
+      const tableId = this.resolveAlias(prefix);
+      if (!nodeMap.has(tableId)) continue;
+
+      if (!columnsByTable.has(tableId)) {
+        columnsByTable.set(tableId, new Set());
+      }
+      columnsByTable.get(tableId).add(col);
+    }
+
+    // Also scan SELECT list for unqualified columns when there's only one table
+    if (nodeMap.size === 1) {
+      const singleId = nodeMap.keys().next().value;
+      const selectMatch = sql.match(/\bSELECT\s+(.*?)\s+FROM\b/is);
+      if (selectMatch) {
+        const cols = selectMatch[1].split(',').map(c => c.trim().replace(/\s+AS\s+.*/i, '').trim());
+        if (!columnsByTable.has(singleId)) columnsByTable.set(singleId, new Set());
+        for (const c of cols) {
+          if (c !== '*' && /^\w+$/.test(c)) columnsByTable.get(singleId).add(c);
+        }
+      }
+    }
+
+    // Assign columns to nodes (preserve INSERT column lists if already set)
+    for (const [tableId, colSet] of columnsByTable) {
+      const node = nodeMap.get(tableId);
+      if (!node) continue;
+      const existing = new Set(node.columns.map(c => c.toLowerCase()));
+      for (const col of colSet) {
+        if (!existing.has(col.toLowerCase())) {
+          node.columns.push(col);
+          existing.add(col.toLowerCase());
+        }
+      }
+    }
+  }
+
+  deduplicateEdges(edges) {
+    const seen = new Set();
+    const result = [];
+    for (const e of edges) {
+      const key = `${e.source}|${e.target}|${e.type}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        result.push(e);
+      }
+    }
+    return result;
+  }
+}

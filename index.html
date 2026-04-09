@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SQL Visualizer</title>
+
+  <!-- CodeMirror -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/theme/dracula.css">
+
+  <!-- App Styles -->
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header id="app-header">
+    <div class="header-left">
+      <h1>SQL Visualizer</h1>
+    </div>
+    <div class="header-right">
+      <select id="sample-queries">
+        <option value="">Load Example...</option>
+        <option value="simple-join">Simple JOIN</option>
+        <option value="multi-join">Multi-table JOIN</option>
+        <option value="subquery">Subquery</option>
+        <option value="insert-select">INSERT...SELECT</option>
+        <option value="create-view">CREATE VIEW</option>
+        <option value="cte">WITH (CTE)</option>
+        <option value="complex">Complex Query</option>
+      </select>
+      <button id="btn-visualize">▶ Visualize</button>
+    </div>
+  </header>
+
+  <main id="app-main">
+    <div class="panel" id="left-panel">
+      <div class="panel-header">
+        <span>SQL Query</span>
+        <button id="btn-clear" title="Clear editor">✕</button>
+      </div>
+      <div id="editor-container">
+        <textarea id="sql-editor"></textarea>
+      </div>
+    </div>
+
+    <div id="divider"></div>
+
+    <div class="panel" id="right-panel">
+      <div class="panel-header">
+        <span>Diagram</span>
+        <div class="diagram-controls">
+          <button id="btn-zoom-in" title="Zoom In">+</button>
+          <button id="btn-zoom-reset" title="Fit to View">⊙</button>
+          <button id="btn-zoom-out" title="Zoom Out">−</button>
+        </div>
+      </div>
+      <div id="diagram-container">
+        <div id="diagram-placeholder">
+          <div class="placeholder-icon">⇄</div>
+          <div class="placeholder-text">Enter a SQL query and click <strong>Visualize</strong></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div id="tooltip" class="tooltip"></div>
+
+  <!-- Libraries -->
+  <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/sql/sql.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+
+  <!-- App Scripts -->
+  <script src="js/parser.js"></script>
+  <script src="js/diagram.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

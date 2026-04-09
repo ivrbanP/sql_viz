@@ -1,0 +1,454 @@
+/* =========================================
+   SQL Visualizer - Styles
+   ========================================= */
+
+:root {
+  --bg-primary: #1a1b2e;
+  --bg-secondary: #1e1f35;
+  --bg-tertiary: #252742;
+  --bg-header: #16172b;
+  --text-primary: #e0e0e8;
+  --text-secondary: #9898b0;
+  --text-muted: #6a6a80;
+  --accent: #6c8cff;
+  --accent-hover: #8da4ff;
+  --border: #2d2f4a;
+  --node-table: #4a9eff;
+  --node-view: #b370f0;
+  --node-cte: #ff9f43;
+  --node-subquery: #6c757d;
+  --edge-join: #7a8aaa;
+  --edge-flow: #4a9eff;
+  --edge-where: #f0c040;
+  --shadow: rgba(0, 0, 0, 0.3);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+/* ---- Header ---- */
+#app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 48px;
+  padding: 0 16px;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  z-index: 10;
+}
+
+#app-header h1 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#sample-queries {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  outline: none;
+}
+
+#sample-queries:hover {
+  border-color: var(--accent);
+}
+
+#btn-visualize {
+  padding: 6px 18px;
+  border-radius: 6px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+#btn-visualize:hover {
+  background: var(--accent-hover);
+}
+
+#btn-visualize:active {
+  transform: scale(0.97);
+}
+
+/* ---- Main Layout ---- */
+#app-main {
+  display: flex;
+  height: calc(100vh - 48px);
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#left-panel {
+  width: 38%;
+  min-width: 280px;
+  background: var(--bg-secondary);
+}
+
+#right-panel {
+  flex: 1;
+  background: var(--bg-primary);
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  padding: 0 12px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-secondary);
+}
+
+#btn-clear {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+#btn-clear:hover {
+  color: var(--text-primary);
+  background: rgba(255,255,255,0.05);
+}
+
+/* ---- Divider ---- */
+#divider {
+  width: 4px;
+  background: var(--border);
+  cursor: col-resize;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+#divider:hover,
+#divider.active {
+  background: var(--accent);
+}
+
+/* ---- Editor ---- */
+#editor-container {
+  flex: 1;
+  overflow: hidden;
+}
+
+.CodeMirror {
+  height: 100% !important;
+  font-size: 14px;
+  line-height: 1.6;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
+}
+
+/* ---- Diagram ---- */
+#diagram-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+#diagram-container svg {
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+
+#diagram-container svg:active {
+  cursor: grabbing;
+}
+
+#diagram-placeholder {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.placeholder-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+  opacity: 0.3;
+}
+
+.placeholder-text {
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.placeholder-text strong {
+  color: var(--accent);
+}
+
+.diagram-controls {
+  display: flex;
+  gap: 4px;
+}
+
+.diagram-controls button {
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.diagram-controls button:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+/* ---- SVG Diagram Nodes ---- */
+.node-group {
+  cursor: pointer;
+}
+
+.node-group:hover .node-body {
+  stroke: #5d8fdd;
+  stroke-width: 2;
+}
+
+.node-body {
+  fill: var(--bg-tertiary);
+  stroke: var(--border);
+  stroke-width: 1.5;
+  filter: drop-shadow(0 2px 8px rgba(0,0,0,0.35));
+}
+
+.node-header-bg {
+  /* sharp rectangle — no rx/ry */
+}
+
+.node-icon {
+  font-size: 14px;
+  fill: rgba(255,255,255,0.85);
+}
+
+.node-title {
+  font-size: 13px;
+  font-weight: 700;
+  fill: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.node-type-badge {
+  font-size: 9px;
+  font-weight: 600;
+  fill: rgba(255,255,255,0.7);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.node-col-dot {
+  fill: #5a5c7a;
+}
+
+.node-column-text {
+  font-size: 12px;
+  fill: var(--text-secondary);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+.node-column-more {
+  font-size: 11px;
+  fill: var(--text-muted);
+  font-style: italic;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.node-column-empty {
+  font-size: 11px;
+  fill: var(--text-muted);
+  font-style: italic;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.node-separator {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+/* ---- SVG Edges ---- */
+.edge-line {
+  fill: none;
+  stroke-width: 1.8;
+}
+
+.edge-line.join {
+  stroke: var(--edge-join);
+}
+
+.edge-line.data_flow {
+  stroke: var(--edge-flow);
+}
+
+.edge-line.implicit_join {
+  stroke: var(--edge-join);
+  stroke-dasharray: 6 4;
+  opacity: 0.6;
+}
+
+.edge-line.where_join {
+  stroke: var(--edge-where);
+  stroke-dasharray: 4 3;
+  opacity: 0.7;
+}
+
+.edge-label {
+  font-size: 10px;
+  fill: var(--text-muted);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-weight: 600;
+  text-anchor: middle;
+}
+
+.edge-label-bg {
+  fill: var(--bg-primary);
+  opacity: 0.85;
+  rx: 3;
+  ry: 3;
+}
+
+/* ---- Tooltip ---- */
+.tooltip {
+  position: fixed;
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-primary);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+  max-width: 400px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  z-index: 100;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+
+.tooltip.visible {
+  opacity: 1;
+}
+
+.tooltip .tt-label {
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.tooltip .tt-cond {
+  color: var(--text-secondary);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+}
+
+/* ---- Error Banner ---- */
+.error-banner {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #ff4444;
+  color: #fff;
+  padding: 8px 20px;
+  border-radius: 6px;
+  font-size: 13px;
+  z-index: 20;
+  box-shadow: 0 4px 12px rgba(255,68,68,0.3);
+  animation: slideUp 0.3s ease;
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* ---- Legend ---- */
+#legend {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  display: flex;
+  gap: 16px;
+  padding: 8px 14px;
+  background: rgba(30, 31, 53, 0.9);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  z-index: 5;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+
+.legend-line {
+  width: 20px;
+  height: 2px;
+}
+
+.legend-line.dashed {
+  background: repeating-linear-gradient(
+    90deg,
+    var(--edge-join) 0px, var(--edge-join) 5px,
+    transparent 5px, transparent 9px
+  );
+}
