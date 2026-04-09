@@ -9,6 +9,10 @@
   let editor;
   let parser;
   let diagram;
+  let lastGraph = null;
+  let editorMarks = [];       // Active CodeMirror text markers
+  let positionIndex = null;   // Maps identifiers to editor positions
+  let hoverTimeout = null;
 
   // ── Sample Queries ───────────────────────────────────────────
 
@@ -31,7 +35,10 @@ FROM orders o
 JOIN customers c ON o.customer_id = c.id
 JOIN order_items oi ON o.id = oi.order_id
 JOIN products p ON oi.product_id = p.id
-LEFT JOIN stores s ON o.store_id = s.id;`,
+LEFT JOIN stores s ON o.store_id = s.id
+WHERE o.status = 'completed'
+  AND c.region = 'US'
+  AND p.category = 'Electronics';`,
 
     'subquery': `SELECT
   e.name,
@@ -123,7 +130,75 @@ SELECT
 FROM employees e
 JOIN departments d ON e.department_id = d.id
 LEFT JOIN locations l ON d.location_id = l.id
-GROUP BY d.department_name;`
+GROUP BY d.department_name;`,
+
+    'complex-ivo': `WITH recent_orders AS (
+  -- orders in the last 12 months
+  SELECT o.*
+  FROM orders o
+  WHERE o.created_at >= (current_date - INTERVAL '12 months')
+),
+user_order_stats AS (
+  -- per-user aggregates: total spent, avg order value, last order date, order count
+  SELECT
+    u.id AS user_id,
+    u.name,
+    u.country,
+    COUNT(ro.id)                         AS orders_count,
+    SUM(ro.total_amount)                 AS total_spent,
+    AVG(NULLIF(ro.total_amount,0))       AS avg_order_value,
+    MAX(ro.created_at)                   AS last_order_at
+  FROM users u
+  LEFT JOIN recent_orders ro ON ro.user_id = u.id
+  GROUP BY u.id, u.name, u.country
+),
+user_top_category AS (
+  -- most-purchased product category per user (by quantity)
+  SELECT ut.user_id, ut.category
+  FROM (
+    SELECT
+      oi_order.user_id,
+      p.category,
+      SUM(oi_order.quantity) AS qty,
+      ROW_NUMBER() OVER (PARTITION BY oi_order.user_id ORDER BY SUM(oi_order.quantity) DESC, p.category) AS rn
+    FROM (
+      SELECT o.id AS order_id, o.user_id
+      FROM recent_orders o
+    ) AS oi_order
+    JOIN order_items oi ON oi.order_id = oi_order.order_id
+    JOIN products p ON p.id = oi.product_id
+    GROUP BY oi_order.user_id, p.category
+  ) ut
+  WHERE ut.rn = 1
+),
+user_review_score AS (
+  -- average rating given by user in last 12 months
+  SELECT r.user_id, AVG(r.rating) AS avg_rating, COUNT(*) AS reviews_count
+  FROM reviews r
+  WHERE r.created_at >= (current_date - INTERVAL '12 months')
+  GROUP BY r.user_id
+)
+SELECT
+  uos.user_id,
+  uos.name,
+  uos.country,
+  COALESCE(uos.orders_count, 0)         AS orders_count,
+  COALESCE(uos.total_spent, 0)::numeric(12,2) AS total_spent,
+  COALESCE(uos.avg_order_value, 0)::numeric(10,2) AS avg_order_value,
+  utc.category                          AS top_category,
+  COALESCE(urs.avg_rating, 0)::numeric(3,2)     AS avg_review_rating,
+  uos.last_order_at,
+  -- churn flag if no order in last 90 days
+  CASE WHEN uos.last_order_at < (current_date - INTERVAL '90 days') OR uos.last_order_at IS NULL THEN TRUE ELSE FALSE END AS is_churned,
+  -- rank users by total_spent (desc)
+  RANK() OVER (ORDER BY COALESCE(uos.total_spent,0) DESC) AS spend_rank
+FROM user_order_stats uos
+LEFT JOIN user_top_category utc ON utc.user_id = uos.user_id
+LEFT JOIN user_review_score urs ON urs.user_id = uos.user_id
+WHERE COALESCE(uos.orders_count,0) > 0
+  AND (uos.country = 'US' OR uos.country = 'CA')
+ORDER BY total_spent DESC
+LIMIT 50 OFFSET 0;`
   };
 
   // ── Initialization ───────────────────────────────────────────
@@ -135,6 +210,7 @@ GROUP BY d.department_name;`
     initEditor();
     initDivider();
     bindEvents();
+    setupEditorHover();
 
     // Load default sample
     editor.setValue(sampleQueries['multi-join']);
@@ -232,11 +308,233 @@ GROUP BY d.department_name;`
         return;
       }
 
+      lastGraph = graph;
       diagram.render(graph);
+
+      // Build position index for cross-highlighting
+      positionIndex = buildPositionIndex(editor.getValue(), graph);
+
+      // Wire diagram → editor hover callbacks
+      diagram.onNodeHover = (nodeId) => {
+        clearEditorHighlights();
+        const ranges = positionIndex.nodeRanges[nodeId];
+        if (ranges) {
+          for (const r of ranges) {
+            editorMarks.push(editor.markText(r.from, r.to, { className: 'cm-highlight-table' }));
+          }
+        }
+      };
+
+      diagram.onColumnHover = (nodeId, colName) => {
+        clearEditorHighlights();
+        // Highlight the column references
+        const key = nodeId + '.' + colName.toLowerCase();
+        const ranges = positionIndex.colRanges[key];
+        if (ranges) {
+          for (const r of ranges) {
+            editorMarks.push(editor.markText(r.from, r.to, { className: 'cm-highlight-column' }));
+          }
+        }
+        // Also highlight the table
+        const tableRanges = positionIndex.nodeRanges[nodeId];
+        if (tableRanges) {
+          for (const r of tableRanges) {
+            editorMarks.push(editor.markText(r.from, r.to, { className: 'cm-highlight-table-dim' }));
+          }
+        }
+      };
+
+      diagram.onHoverOut = () => {
+        clearEditorHighlights();
+        diagram.clearHighlight();
+      };
+
     } catch (err) {
       console.error('Parse error:', err);
       diagram.showError('Error parsing SQL: ' + err.message);
     }
+  }
+
+  // ── Position Index ───────────────────────────────────────────
+
+  function buildPositionIndex(sql, graph) {
+    const index = {
+      nodeRanges: {},   // nodeId -> [{from, to}]
+      colRanges: {},    // "nodeId.col" -> [{from, to}]
+      wordMap: {},      // word (lower) -> nodeId (for editor → diagram)
+    };
+
+    // Get alias map from parser
+    const aliasMap = parser.aliasMap;
+
+    // Build a reverse map: tableId -> [alias, tableName, ...]
+    const namesByNode = {};
+    for (const node of graph.nodes) {
+      const id = node.id;
+      namesByNode[id] = new Set([node.name.toLowerCase()]);
+      index.wordMap[node.name.toLowerCase()] = id;
+    }
+    for (const [alias, tableId] of aliasMap) {
+      if (namesByNode[tableId]) {
+        namesByNode[tableId].add(alias.toLowerCase());
+        index.wordMap[alias.toLowerCase()] = tableId;
+      }
+    }
+
+    // Also map columns to their parent node
+    for (const node of graph.nodes) {
+      for (const col of node.columns) {
+        const key = node.id + '.' + col.toLowerCase();
+        index.wordMap[col.toLowerCase()] = { nodeId: node.id, col: col.toLowerCase() };
+      }
+    }
+
+    // Scan the SQL text for word positions
+    const lines = sql.split('\n');
+    const wordPattern = /[a-zA-Z_]\w*/g;
+
+    for (let lineNo = 0; lineNo < lines.length; lineNo++) {
+      const line = lines[lineNo];
+      let m;
+      wordPattern.lastIndex = 0;
+
+      while ((m = wordPattern.exec(line)) !== null) {
+        const word = m[0].toLowerCase();
+        const ch = m.index;
+        const from = { line: lineNo, ch: ch };
+        const to = { line: lineNo, ch: ch + m[0].length };
+
+        // Check if this is a table name or alias
+        for (const [nodeId, names] of Object.entries(namesByNode)) {
+          if (names.has(word)) {
+            if (!index.nodeRanges[nodeId]) index.nodeRanges[nodeId] = [];
+            index.nodeRanges[nodeId].push({ from, to });
+          }
+        }
+
+        // Check if preceded by "alias." — then it's a column reference
+        // Look for pattern: alias.column
+        const prefixMatch = line.slice(0, ch).match(/(\w+)\s*\.\s*$/);
+        if (prefixMatch) {
+          const prefix = prefixMatch[1].toLowerCase();
+          const resolvedTable = aliasMap.get(prefix) || prefix;
+          if (namesByNode[resolvedTable]) {
+            const key = resolvedTable + '.' + word;
+            if (!index.colRanges[key]) index.colRanges[key] = [];
+            // Mark the full "alias.column" range
+            const dotStart = ch - prefixMatch[0].length;
+            index.colRanges[key].push({
+              from: { line: lineNo, ch: dotStart },
+              to: to
+            });
+          }
+        }
+      }
+    }
+
+    return index;
+  }
+
+  // ── Editor → Diagram highlighting ───────────────────────────
+
+  function setupEditorHover() {
+    const cmWrapper = editor.getWrapperElement();
+
+    cmWrapper.addEventListener('mousemove', (e) => {
+      if (hoverTimeout) clearTimeout(hoverTimeout);
+      hoverTimeout = setTimeout(() => {
+        handleEditorHover(e);
+      }, 50);
+    });
+
+    cmWrapper.addEventListener('mouseleave', () => {
+      if (hoverTimeout) clearTimeout(hoverTimeout);
+      clearEditorHighlights();
+      diagram.clearHighlight();
+    });
+  }
+
+  function handleEditorHover(e) {
+    if (!positionIndex || !lastGraph) return;
+
+    const pos = editor.coordsChar({ left: e.clientX, top: e.clientY });
+    if (!pos || pos.outside) {
+      diagram.clearHighlight();
+      return;
+    }
+
+    // Get the word at cursor position
+    const line = editor.getLine(pos.line);
+    if (!line) { diagram.clearHighlight(); return; }
+
+    const word = getWordAt(line, pos.ch);
+    if (!word) { diagram.clearHighlight(); return; }
+
+    const wordLower = word.toLowerCase();
+
+    // Check if it's a table/alias name
+    const aliasMap = parser.aliasMap;
+    const resolvedTable = aliasMap.get(wordLower) || wordLower;
+
+    // Find if this word is a known table/alias
+    if (positionIndex.nodeRanges[resolvedTable]) {
+      diagram.clearHighlight();
+      diagram.highlightNode(resolvedTable);
+      return;
+    }
+
+    // Check if it's part of alias.column pattern
+    const beforeDot = line.slice(0, pos.ch).match(/(\w+)\s*\.\s*$/);
+    const afterDot = line.slice(pos.ch).match(/^\.?\s*(\w+)/);
+
+    if (beforeDot) {
+      // Cursor is on "column" in "alias.column"
+      const prefix = beforeDot[1].toLowerCase();
+      const tableId = aliasMap.get(prefix) || prefix;
+      if (positionIndex.nodeRanges[tableId]) {
+        diagram.clearHighlight();
+        diagram.highlightColumn(tableId, wordLower);
+        return;
+      }
+    }
+
+    if (afterDot && /\.\s*$/.test(line.slice(0, getWordStart(line, pos.ch)))) {
+      // Already handled above
+    }
+
+    // Check if word is a column name on any table
+    for (const node of lastGraph.nodes) {
+      for (const col of node.columns) {
+        if (col.toLowerCase() === wordLower) {
+          diagram.clearHighlight();
+          diagram.highlightColumn(node.id, wordLower);
+          return;
+        }
+      }
+    }
+
+    diagram.clearHighlight();
+  }
+
+  function getWordAt(line, ch) {
+    const start = getWordStart(line, ch);
+    let end = ch;
+    while (end < line.length && /\w/.test(line[end])) end++;
+    if (start === end) return null;
+    return line.slice(start, end);
+  }
+
+  function getWordStart(line, ch) {
+    let start = ch;
+    while (start > 0 && /\w/.test(line[start - 1])) start--;
+    return start;
+  }
+
+  function clearEditorHighlights() {
+    for (const mark of editorMarks) {
+      mark.clear();
+    }
+    editorMarks = [];
   }
 
   // ── Bootstrap ────────────────────────────────────────────────

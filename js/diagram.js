@@ -29,6 +29,10 @@ class DiagramRenderer {
     this.nodePositions = new Map();
     // Edge data: array of { source, target, type, label, condition }
     this.edgeData = [];
+    // Hover callbacks
+    this.onNodeHover = null;   // (nodeId) => void
+    this.onColumnHover = null; // (nodeId, colName) => void
+    this.onHoverOut = null;    // () => void
   }
 
   render(graph) {
@@ -161,9 +165,14 @@ class DiagramRenderer {
       const bodyHeight = colCount > 0
         ? colCount * this.lineHeight + (hasMore ? this.lineHeight : 0) + 10
         : 10;
-      const height = this.headerHeight + bodyHeight;
 
-      return { ...node, width, height };
+      // WHERE section: collapsed = one row for the badge
+      const hasFilters = (node.filters || []).length > 0;
+      const whereHeight = hasFilters ? this.lineHeight + 10 : 0;
+
+      const height = this.headerHeight + bodyHeight + whereHeight;
+
+      return { ...node, width, height, _whereExpanded: false };
     });
   }
 
@@ -213,6 +222,7 @@ class DiagramRenderer {
 
       const group = nodesG.append('g')
         .attr('class', 'node-group')
+        .attr('data-node-id', nodeId)
         .attr('transform', `translate(${x}, ${y})`)
         .call(this.createDrag(nodeId));
 
@@ -228,6 +238,20 @@ class DiagramRenderer {
         .attr('width', node.width)
         .attr('height', this.headerHeight)
         .attr('fill', color);
+
+      // Invisible header hover zone for table-level hover
+      group.append('rect')
+        .attr('class', 'node-header-hover')
+        .attr('width', node.width)
+        .attr('height', this.headerHeight)
+        .attr('fill', 'transparent')
+        .style('cursor', 'pointer')
+        .on('mouseenter', () => {
+          if (self.onNodeHover) self.onNodeHover(nodeId);
+        })
+        .on('mouseleave', () => {
+          if (self.onHoverOut) self.onHoverOut();
+        });
 
       // Icon
       const icon = node.type === 'view' ? '◫' : node.type === 'cte' ? '⊞' : node.type === 'subquery' ? '◻' : '⊞';
@@ -277,12 +301,22 @@ class DiagramRenderer {
             .attr('r', 3);
 
           // Column name
+          const isGrouped = (node.groupByColumns || []).includes(col.toLowerCase());
           group.append('text')
-            .attr('class', 'node-column-text')
+            .attr('class', 'node-column-text' + (isGrouped ? ' node-column-grouped' : ''))
+            .attr('data-column', col)
+            .attr('data-node-id', nodeId)
             .attr('x', this.padding + this.colIconWidth)
             .attr('y', cy)
             .attr('dominant-baseline', 'central')
-            .text(col);
+            .text(col)
+            .style('cursor', 'pointer')
+            .on('mouseenter', () => {
+              if (self.onColumnHover) self.onColumnHover(nodeId, col);
+            })
+            .on('mouseleave', () => {
+              if (self.onHoverOut) self.onHoverOut();
+            });
         });
 
         if (hasMore) {
@@ -303,6 +337,105 @@ class DiagramRenderer {
           .attr('dominant-baseline', 'central')
           .attr('text-anchor', 'middle')
           .text('(no columns)');
+      }
+
+      // WHERE filter section
+      const filters = node.filters || [];
+      if (filters.length > 0) {
+        const colsShown = Math.min((node.columns || []).length, 12);
+        const hasMoreCols = (node.columns || []).length > 12;
+        const colsSectionH = colsShown > 0
+          ? colsShown * this.lineHeight + (hasMoreCols ? this.lineHeight : 0) + 6
+          : 0;
+        const whereY = this.headerHeight + colsSectionH + 4;
+
+        // Separator above WHERE
+        group.append('line')
+          .attr('class', 'node-separator')
+          .attr('x1', 0)
+          .attr('y1', whereY)
+          .attr('x2', node.width)
+          .attr('y2', whereY);
+
+        // WHERE badge (clickable)
+        const whereG = group.append('g')
+          .attr('class', 'node-where-group')
+          .style('cursor', 'pointer');
+
+        const badgeY = whereY + this.lineHeight / 2 + 4;
+
+        // Filter icon
+        whereG.append('text')
+          .attr('class', 'node-where-icon')
+          .attr('x', this.padding)
+          .attr('y', badgeY)
+          .attr('dominant-baseline', 'central')
+          .text('▸');
+
+        whereG.append('text')
+          .attr('class', 'node-where-label')
+          .attr('x', this.padding + 14)
+          .attr('y', badgeY)
+          .attr('dominant-baseline', 'central')
+          .text('WHERE');
+
+        // Filter count
+        whereG.append('text')
+          .attr('class', 'node-where-count')
+          .attr('x', this.padding + 62)
+          .attr('y', badgeY)
+          .attr('dominant-baseline', 'central')
+          .text(`(${filters.length})`);
+
+        // Expanded content (hidden initially)
+        const expandedG = group.append('g')
+          .attr('class', 'node-where-expanded')
+          .style('display', 'none');
+
+        filters.forEach((f, idx) => {
+          const fy = whereY + this.lineHeight + 6 + idx * this.lineHeight;
+          expandedG.append('text')
+            .attr('class', 'node-where-text')
+            .attr('x', this.padding + 14)
+            .attr('y', fy)
+            .attr('dominant-baseline', 'central')
+            .text(f.length > 40 ? f.slice(0, 38) + '…' : f)
+            .append('title').text(f);
+        });
+
+        // Click to toggle expand/collapse
+        whereG.on('click', (event) => {
+          event.stopPropagation();
+          const isVisible = expandedG.style('display') !== 'none';
+          const arrow = whereG.select('.node-where-icon');
+
+          if (isVisible) {
+            // Collapse
+            expandedG.style('display', 'none');
+            arrow.text('▸');
+            // Shrink body rect
+            const collapsedH = this.headerHeight
+              + (colsShown > 0 ? colsShown * this.lineHeight + (hasMoreCols ? this.lineHeight : 0) + 10 : 10)
+              + this.lineHeight + 10;
+            group.select('.node-body').attr('height', collapsedH);
+            // Update stored position height for edge routing
+            const pos = self.nodePositions.get(nodeId);
+            if (pos) pos.height = collapsedH;
+          } else {
+            // Expand
+            expandedG.style('display', null);
+            arrow.text('▾');
+            const expandedH = this.headerHeight
+              + (colsShown > 0 ? colsShown * this.lineHeight + (hasMoreCols ? this.lineHeight : 0) + 10 : 10)
+              + this.lineHeight + 10
+              + filters.length * this.lineHeight + 4;
+            group.select('.node-body').attr('height', expandedH);
+            const pos = self.nodePositions.get(nodeId);
+            if (pos) pos.height = expandedH;
+          }
+          // Re-render edges for updated box size
+          self.renderEdges();
+        });
       }
     });
   }
@@ -331,7 +464,10 @@ class DiagramRenderer {
         .y(d => d.y)
         .curve(d3.curveBasis);
 
-      const edgeGroup = this.edgesG.append('g').attr('class', 'edge-group');
+      const edgeGroup = this.edgesG.append('g')
+        .attr('class', 'edge-group')
+        .attr('data-source', edgeInfo.source)
+        .attr('data-target', edgeInfo.target);
 
       edgeGroup.append('path')
         .attr('class', `edge-line ${type}`)
@@ -494,6 +630,54 @@ class DiagramRenderer {
 
   zoomReset() {
     this.fitToView();
+  }
+
+  // ── Highlighting API ───────────────────────────────────────────
+
+  highlightNode(nodeId) {
+    if (!this.g) return;
+    // Dim all nodes
+    this.g.selectAll('.node-group').classed('dimmed', true);
+    // Bright the target node
+    this.g.selectAll(`.node-group[data-node-id="${nodeId}"]`)
+      .classed('dimmed', false)
+      .classed('highlighted', true);
+    // Dim all edges, then highlight connected ones
+    this.edgesG.selectAll('.edge-group').each(function() {
+      const el = d3.select(this);
+      const src = el.attr('data-source');
+      const tgt = el.attr('data-target');
+      if (src === nodeId || tgt === nodeId) {
+        el.classed('dimmed', false).selectAll('.edge-line').classed('highlighted', true);
+      } else {
+        el.classed('dimmed', true);
+      }
+    });
+  }
+
+  highlightColumn(nodeId, colName) {
+    if (!this.g) return;
+    // Dim all nodes
+    this.g.selectAll('.node-group').classed('dimmed', true);
+    // Bright the target node
+    const nodeGroup = this.g.selectAll(`.node-group[data-node-id="${nodeId}"]`);
+    nodeGroup.classed('dimmed', false).classed('highlighted', true);
+    // Highlight the specific column
+    nodeGroup.selectAll(`.node-column-text[data-column="${colName}"]`)
+      .classed('col-highlighted', true);
+    // Dim all edges
+    this.edgesG.selectAll('.edge-group').classed('dimmed', true);
+  }
+
+  clearHighlight() {
+    if (!this.g) return;
+    this.g.selectAll('.node-group')
+      .classed('dimmed', false)
+      .classed('highlighted', false);
+    this.g.selectAll('.node-column-text')
+      .classed('col-highlighted', false);
+    this.edgesG.selectAll('.edge-group').classed('dimmed', false);
+    this.edgesG.selectAll('.edge-line').classed('highlighted', false);
   }
 
   showTooltip(event, label, condition) {

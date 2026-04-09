@@ -30,6 +30,12 @@ class SQLParser {
     // Post-process: extract column references from the SQL
     this.extractColumns(sql, nodeMap);
 
+    // Post-process: extract WHERE filter conditions per table
+    this.extractWhereFilters(sql, nodeMap);
+
+    // Post-process: extract GROUP BY columns
+    this.extractGroupByColumns(sql, nodeMap);
+
     return {
       nodes: Array.from(nodeMap.values()),
       edges: this.deduplicateEdges(edges)
@@ -140,7 +146,7 @@ class SQLParser {
     const name = this.cleanName(rawName);
     const key = name.toLowerCase();
     if (!nodeMap.has(key)) {
-      nodeMap.set(key, { id: key, name: name, type: type || 'table', columns: [] });
+      nodeMap.set(key, { id: key, name: name, type: type || 'table', columns: [], filters: [] });
     }
     const node = nodeMap.get(key);
     // Upgrade type if more specific
@@ -856,6 +862,153 @@ class SQLParser {
         }
       }
     }
+  }
+
+  extractGroupByColumns(sql, nodeMap) {
+    const cleaned = this.removeComments(sql);
+    const tokens = this.tokenize(cleaned);
+
+    let i = 0;
+    while (i < tokens.length) {
+      // Look for GROUP BY
+      if (tokens[i].u === 'GROUP' && i + 1 < tokens.length && tokens[i + 1].u === 'BY') {
+        i += 2; // skip GROUP BY
+        const endKw = new Set(['HAVING', 'ORDER', 'LIMIT', 'UNION', 'EXCEPT',
+          'INTERSECT', 'FETCH', 'OFFSET', 'WINDOW', 'FOR', 'INSERT', 'UPDATE',
+          'DELETE', 'SELECT', 'WITH', 'CREATE']);
+
+        while (i < tokens.length && !endKw.has(tokens[i].u) && tokens[i].v !== ';' && tokens[i].v !== ')') {
+          // Look for alias.column or bare column
+          if (i + 2 < tokens.length && tokens[i + 1].v === '.') {
+            const prefix = tokens[i].v;
+            const col = tokens[i + 2].v;
+            const tableId = this.resolveAlias(prefix);
+            const node = nodeMap.get(tableId);
+            if (node) {
+              if (!node.groupByColumns) node.groupByColumns = new Set();
+              node.groupByColumns.add(col.toLowerCase());
+            }
+            i += 3;
+          } else if (tokens[i].t === 'word' && tokens[i].v !== ',') {
+            // Bare column — assign to single table or skip
+            const col = tokens[i].v;
+            if (nodeMap.size === 1) {
+              const node = nodeMap.values().next().value;
+              if (!node.groupByColumns) node.groupByColumns = new Set();
+              node.groupByColumns.add(col.toLowerCase());
+            }
+            i++;
+          } else {
+            i++;
+          }
+        }
+      } else {
+        i++;
+      }
+    }
+
+    // Convert Sets to arrays for serialization
+    for (const node of nodeMap.values()) {
+      if (node.groupByColumns) {
+        node.groupByColumns = Array.from(node.groupByColumns);
+      } else {
+        node.groupByColumns = [];
+      }
+    }
+  }
+
+  extractWhereFilters(sql, nodeMap) {
+    // Find all WHERE clauses and extract individual conditions per table
+    const cleaned = this.removeComments(sql);
+    const tokens = this.tokenize(cleaned);
+
+    let i = 0;
+    while (i < tokens.length) {
+      if (tokens[i].u === 'WHERE') {
+        i++;
+        // Collect tokens until end of WHERE clause
+        const endKw = new Set(['GROUP', 'ORDER', 'HAVING', 'LIMIT', 'UNION', 'EXCEPT',
+          'INTERSECT', 'FETCH', 'OFFSET', 'WINDOW', 'FOR', 'INSERT', 'UPDATE', 'DELETE',
+          'CREATE', 'INTO']);
+        let depth = 0;
+        const whereStart = i;
+
+        while (i < tokens.length) {
+          if (tokens[i].v === '(') depth++;
+          if (tokens[i].v === ')') {
+            if (depth === 0) break;
+            depth--;
+          }
+          if (depth === 0 && endKw.has(tokens[i].u)) break;
+          i++;
+        }
+
+        // Split WHERE clause into individual conditions (split on AND/OR at depth 0)
+        const conditions = this.splitWhereConditions(tokens, whereStart, i);
+
+        for (const cond of conditions) {
+          // Find which tables this condition references
+          const refs = [...cond.matchAll(/\b(\w+)\s*\./g)]
+            .map(m => this.resolveAlias(m[1]))
+            .filter(id => nodeMap.has(id));
+
+          // Also check for unqualified column comparisons with literals
+          // (these apply to all tables in scope but we skip those)
+
+          const uniqueRefs = [...new Set(refs)];
+
+          // If condition references exactly one table, it's a filter on that table
+          // If it references two tables, it's a join condition (already handled)
+          if (uniqueRefs.length === 1) {
+            const node = nodeMap.get(uniqueRefs[0]);
+            if (node && !node.filters.includes(cond.trim())) {
+              node.filters.push(cond.trim());
+            }
+          } else if (uniqueRefs.length === 0) {
+            // Unqualified condition — try to find if single table in scope
+            // Skip for now (ambiguous)
+          }
+        }
+      }
+      i++;
+    }
+  }
+
+  splitWhereConditions(tokens, start, end) {
+    const conditions = [];
+    let depth = 0;
+    let condStart = start;
+
+    for (let i = start; i < end; i++) {
+      if (tokens[i].v === '(') depth++;
+      if (tokens[i].v === ')') depth--;
+      if (depth === 0 && (tokens[i].u === 'AND' || tokens[i].u === 'OR')) {
+        const text = this.tokensToString(tokens, condStart, i);
+        if (text) conditions.push(text);
+        condStart = i + 1;
+      }
+    }
+    // Last condition
+    const text = this.tokensToString(tokens, condStart, end);
+    if (text) conditions.push(text);
+
+    return conditions;
+  }
+
+  tokensToString(tokens, start, end) {
+    let result = '';
+    for (let i = start; i < end; i++) {
+      const t = tokens[i];
+      if (t.v === '.') {
+        result += '.';
+      } else if (i > start && tokens[i - 1].v === '.') {
+        result += t.v;
+      } else {
+        if (result && !/[(\s]$/.test(result)) result += ' ';
+        result += t.v;
+      }
+    }
+    return result.trim();
   }
 
   deduplicateEdges(edges) {
