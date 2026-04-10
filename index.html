@@ -18,6 +18,15 @@
       <h1>SQL Visualizer</h1>
     </div>
     <div class="header-right">
+      <div class="dialect-selector">
+        <label for="sql-dialect">Dialect:</label>
+        <select id="sql-dialect">
+          <option value="postgresql" selected>PostgreSQL</option>
+          <option value="oracle">Oracle</option>
+          <option value="mysql">MySQL</option>
+          <option value="mssql">MS SQL</option>
+        </select>
+      </div>
       <select id="sample-queries">
         <option value="">Load Example...</option>
         <option value="simple-join">Simple JOIN</option>
@@ -73,8 +82,8 @@
   <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
 
   <!-- App Scripts -->
-  <script src="js/parser.js?v=3"></script>
-  <script src="js/diagram.js?v=3"></script>
-  <script src="js/app.js?v=3"></script>
+  <script src="js/parser.js?v=7"></script>
+  <script src="js/diagram.js?v=7"></script>
+  <script src="js/app.js?v=7"></script>
 </body>
 </html>

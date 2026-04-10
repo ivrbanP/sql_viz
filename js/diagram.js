@@ -15,6 +15,7 @@ class DiagramRenderer {
       view: '#b370f0',
       cte: '#ff9f43',
       subquery: '#6c757d',
+      result: '#50c878',
     };
 
     // Sizing
@@ -230,14 +231,27 @@ class DiagramRenderer {
       group.append('rect')
         .attr('class', 'node-body')
         .attr('width', node.width)
-        .attr('height', node.height);
+        .attr('height', node.height)
+        .attr('rx', 10)
+        .attr('ry', 10);
+
+      // Clip path for header (to respect top rounded corners)
+      const clipId = 'clip-' + nodeId.replace(/[^a-zA-Z0-9]/g, '_');
+      group.append('clipPath')
+        .attr('id', clipId)
+        .append('rect')
+        .attr('width', node.width)
+        .attr('height', node.height)
+        .attr('rx', 10)
+        .attr('ry', 10);
 
       // Header background
       group.append('rect')
         .attr('class', 'node-header-bg')
         .attr('width', node.width)
         .attr('height', this.headerHeight)
-        .attr('fill', color);
+        .attr('fill', color)
+        .attr('clip-path', `url(#${clipId})`);
 
       // Invisible header hover zone for table-level hover
       group.append('rect')
@@ -245,6 +259,8 @@ class DiagramRenderer {
         .attr('width', node.width)
         .attr('height', this.headerHeight)
         .attr('fill', 'transparent')
+        .attr('rx', 10)
+        .attr('ry', 10)
         .style('cursor', 'pointer')
         .on('mouseenter', () => {
           if (self.onNodeHover) self.onNodeHover(nodeId);
@@ -254,7 +270,7 @@ class DiagramRenderer {
         });
 
       // Icon
-      const icon = node.type === 'view' ? '◫' : node.type === 'cte' ? '⊞' : node.type === 'subquery' ? '◻' : '⊞';
+      const icon = node.type === 'view' ? '◫' : node.type === 'cte' ? '⊞' : node.type === 'subquery' ? '◻' : node.type === 'result' ? '⊳' : '⊞';
       group.append('text')
         .attr('class', 'node-icon')
         .attr('x', this.padding - 1)
@@ -726,6 +742,7 @@ class DiagramRenderer {
     if (types.has('view')) items.push({ color: this.colors.view, label: 'View' });
     if (types.has('cte')) items.push({ color: this.colors.cte, label: 'CTE' });
     if (types.has('subquery')) items.push({ color: this.colors.subquery, label: 'Subquery' });
+    if (types.has('result')) items.push({ color: this.colors.result, label: 'Result' });
 
     for (const item of items) {
       const el = document.createElement('div');

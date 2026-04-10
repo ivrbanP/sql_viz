@@ -6,11 +6,13 @@ class SQLParser {
   constructor() {
     this.subqueryCount = 0;
     this.aliasMap = new Map(); // alias (lower) -> table name (lower)
+    this.dialect = 'postgresql';  // postgresql | oracle | mysql | mssql
   }
 
-  parse(sql) {
+  parse(sql, dialect) {
     this.subqueryCount = 0;
     this.aliasMap = new Map();
+    this.dialect = (dialect || 'postgresql').toLowerCase();
 
     sql = this.removeComments(sql);
     const statements = this.splitStatements(sql);
@@ -133,6 +135,15 @@ class SQLParser {
         i = j; continue;
       }
 
+      // Multi-character operators: ::, !=, <>, <=, >=
+      if (i + 1 < len) {
+        const two = sql[i] + sql[i + 1];
+        if (two === '::' || two === '!=' || two === '<>' || two === '<=' || two === '>=') {
+          tokens.push({ t: 'P', v: two, u: two });
+          i += 2; continue;
+        }
+      }
+
       // Symbol
       tokens.push({ t: 'P', v: sql[i], u: sql[i] });
       i++;
@@ -208,6 +219,69 @@ class SQLParser {
     return allTables;
   }
 
+  extractSelectListColumns(tokens, start, end) {
+    // Skip SELECT [DISTINCT|ALL] [TOP N]
+    let i = start;
+    if (i < end && tokens[i].u === 'SELECT') i++;
+    if (i < end && (tokens[i].u === 'DISTINCT' || tokens[i].u === 'ALL')) i++;
+    // MSSQL: TOP N [PERCENT] [WITH TIES]
+    if (i < end && tokens[i].u === 'TOP') {
+      i++;
+      if (i < end && tokens[i].v === '(') { i = this.findCloseParen(tokens, i) + 1; }
+      else if (i < end && tokens[i].t === 'N') { i++; }
+      if (i < end && tokens[i].u === 'PERCENT') i++;
+      if (i + 1 < end && tokens[i].u === 'WITH' && tokens[i + 1].u === 'TIES') i += 2;
+    }
+
+    // Find FROM at depth 0 to know where the select list ends
+    let depth = 0;
+    let fromPos = end;
+    for (let j = i; j < end; j++) {
+      if (tokens[j].v === '(') depth++;
+      if (tokens[j].v === ')') depth--;
+      if (depth === 0 && tokens[j].u === 'FROM') { fromPos = j; break; }
+    }
+
+    // Split select list on commas at depth 0
+    const cols = [];
+    depth = 0;
+    let itemStart = i;
+    for (let j = i; j <= fromPos; j++) {
+      if (j < fromPos) {
+        if (tokens[j].v === '(') depth++;
+        if (tokens[j].v === ')') depth--;
+      }
+      if ((depth === 0 && j < fromPos && tokens[j].v === ',') || j === fromPos) {
+        // Extract column name: last AS alias, or last word token
+        const itemTokens = tokens.slice(itemStart, j);
+        const name = this.resolveSelectItemName(itemTokens);
+        if (name && name !== '*') cols.push(name);
+        itemStart = j + 1;
+      }
+    }
+    return cols;
+  }
+
+  resolveSelectItemName(itemTokens) {
+    if (itemTokens.length === 0) return null;
+
+    // If there's an AS keyword, the alias follows it
+    for (let i = itemTokens.length - 1; i >= 0; i--) {
+      if (itemTokens[i].u === 'AS' && i + 1 < itemTokens.length) {
+        return itemTokens[i + 1].v;
+      }
+    }
+
+    // No AS — use the last word token (handles alias.col -> col)
+    for (let i = itemTokens.length - 1; i >= 0; i--) {
+      if (itemTokens[i].t === 'W' && !this.isKeyword(itemTokens[i].u)) {
+        return itemTokens[i].v;
+      }
+    }
+
+    return null;
+  }
+
   splitUnion(tokens, start, end) {
     const parts = [];
     let depth = 0;
@@ -216,7 +290,7 @@ class SQLParser {
     for (let i = start; i < end; i++) {
       if (tokens[i].v === '(') depth++;
       if (tokens[i].v === ')') depth--;
-      if (depth === 0 && (tokens[i].u === 'UNION' || tokens[i].u === 'EXCEPT' || tokens[i].u === 'INTERSECT')) {
+      if (depth === 0 && (tokens[i].u === 'UNION' || tokens[i].u === 'EXCEPT' || tokens[i].u === 'INTERSECT' || tokens[i].u === 'MINUS')) {
         parts.push({ start: partStart, end: i });
         // Skip ALL
         i++;
@@ -337,8 +411,8 @@ class SQLParser {
       const subName = 'subquery_' + (++this.subqueryCount);
       const subNode = this.getOrCreateNode(nodeMap, subName, 'subquery');
 
-      // Recursively analyze
-      this.analyzeSelect(tokens, pos + 1, closeP, nodeMap, edges, null);
+      // Recursively analyze — pass subNode.id so inner tables get data_flow edges
+      this.analyzeSelect(tokens, pos + 1, closeP, nodeMap, edges, subNode.id);
 
       let nextPos = closeP + 1;
 
@@ -346,12 +420,18 @@ class SQLParser {
       if (nextPos < limit && tokens[nextPos].u === 'AS') nextPos++;
       if (nextPos < limit && this.isIdentifier(tokens[nextPos])) {
         const aliasName = tokens[nextPos].v;
-        // Rename the subquery node
-        nodeMap.delete(subName.toLowerCase());
+        // Rename the subquery node — update edges that reference old id
+        const oldId = subNode.id;
+        nodeMap.delete(oldId);
         subNode.name = aliasName;
         subNode.id = aliasName.toLowerCase();
         nodeMap.set(subNode.id, subNode);
         this.addAlias(aliasName, subNode.id);
+        // Patch edges that used the temporary subquery id
+        for (const edge of edges) {
+          if (edge.source === oldId) edge.source = subNode.id;
+          if (edge.target === oldId) edge.target = subNode.id;
+        }
         nextPos++;
       }
 
@@ -366,11 +446,36 @@ class SQLParser {
     // Regular table: [schema.]table [AS] alias
     const ref = this.readTableRef(tokens, pos);
     if (ref) {
+      // Oracle: skip DUAL pseudo-table
+      if (this.dialect === 'oracle' && ref.name.toLowerCase() === 'dual') {
+        return null;
+      }
+
       const node = this.getOrCreateNode(nodeMap, ref.name, 'table');
       if (ref.alias) {
         this.addAlias(ref.alias, ref.name);
       }
-      return { node, nextPos: ref.nextPos };
+
+      let nextPos = ref.nextPos;
+
+      // MSSQL: skip WITH (NOLOCK) / WITH (READUNCOMMITTED) etc.
+      if (this.dialect === 'mssql' && nextPos < limit && tokens[nextPos].u === 'WITH' &&
+          nextPos + 1 < limit && tokens[nextPos + 1].v === '(') {
+        const cp = this.findCloseParen(tokens, nextPos + 1);
+        nextPos = cp + 1;
+      }
+
+      // MySQL: skip USE INDEX / FORCE INDEX / IGNORE INDEX hints
+      if (this.dialect === 'mysql' && nextPos < limit &&
+          (tokens[nextPos].u === 'USE' || tokens[nextPos].u === 'FORCE' || tokens[nextPos].u === 'IGNORE') &&
+          nextPos + 1 < limit && tokens[nextPos + 1].u === 'INDEX') {
+        nextPos += 2;
+        if (nextPos < limit && tokens[nextPos].v === '(') {
+          nextPos = this.findCloseParen(tokens, nextPos) + 1;
+        }
+      }
+
+      return { node, nextPos };
     }
 
     return null;
@@ -409,6 +514,16 @@ class SQLParser {
     let i = pos;
     let type = '';
 
+    // MSSQL: CROSS APPLY / OUTER APPLY
+    if (this.dialect === 'mssql') {
+      if (i + 1 < tokens.length && tokens[i].u === 'CROSS' && tokens[i + 1].u === 'APPLY') {
+        return { matched: true, type: 'CROSS APPLY', nextPos: i + 2 };
+      }
+      if (i + 1 < tokens.length && tokens[i].u === 'OUTER' && tokens[i + 1].u === 'APPLY') {
+        return { matched: true, type: 'OUTER APPLY', nextPos: i + 2 };
+      }
+    }
+
     while (i < tokens.length && modifiers.has(tokens[i].u)) {
       type += tokens[i].u + ' ';
       i++;
@@ -421,6 +536,11 @@ class SQLParser {
     if (i < tokens.length && tokens[i].u === 'JOIN') {
       type = (type + 'JOIN').trim();
       return { matched: true, type, nextPos: i + 1 };
+    }
+
+    // MySQL: STRAIGHT_JOIN
+    if (this.dialect === 'mysql' && pos < tokens.length && tokens[pos].u === 'STRAIGHT_JOIN') {
+      return { matched: true, type: 'STRAIGHT_JOIN', nextPos: pos + 1 };
     }
 
     if (pos < tokens.length && tokens[pos].u === 'JOIN') {
@@ -465,7 +585,16 @@ class SQLParser {
   findFromClauseEnd(tokens, start, end) {
     let depth = 0;
     const endKw = new Set(['WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'UNION', 'EXCEPT',
-      'INTERSECT', 'FETCH', 'OFFSET', 'WINDOW', 'FOR', 'INTO']);
+      'INTERSECT', 'FETCH', 'OFFSET', 'WINDOW', 'FOR', 'INTO', 'MINUS']);
+    // Oracle: CONNECT BY, START WITH also end the FROM clause
+    if (this.dialect === 'oracle') {
+      endKw.add('CONNECT');
+      endKw.add('START');
+    }
+    // MSSQL: OPTION clause
+    if (this.dialect === 'mssql') {
+      endKw.add('OPTION');
+    }
     for (let i = start; i < end; i++) {
       if (tokens[i].v === '(') depth++;
       if (tokens[i].v === ')') depth--;
@@ -703,9 +832,16 @@ class SQLParser {
     // Main query after CTEs
     if (i < tokens.length) {
       const first = tokens[i].u;
-      const targetId = outerTargetId || null;
+      let targetId = outerTargetId || null;
 
       if (first === 'SELECT') {
+        // If no outer target, create a "Query Result" output node
+        if (!targetId) {
+          const resultNode = this.getOrCreateNode(nodeMap, 'Query Result', 'result');
+          targetId = resultNode.id;
+          // Extract output column names from the SELECT list
+          resultNode.columns = this.extractSelectListColumns(tokens, i, tokens.length);
+        }
         this.analyzeSelect(tokens, i, tokens.length, nodeMap, edges, targetId);
       } else if (first === 'INSERT') {
         this.analyzeInsert(tokens.slice(i), nodeMap, edges);
@@ -743,7 +879,7 @@ class SQLParser {
       if (left !== right && nodeMap.has(left) && nodeMap.has(right)) {
         // Check if a join edge already exists between these two
         const exists = edges.some(e =>
-          e.type === 'join' && (
+          (e.type === 'join' || e.type === 'where_join') && (
             (e.source === left && e.target === right) ||
             (e.source === right && e.target === left)
           )
@@ -757,6 +893,51 @@ class SQLParser {
             label: `${match[1]}.${match[2]} = ${match[3]}.${match[4]}`,
             condition: `${match[1]}.${match[2]} = ${match[3]}.${match[4]}`
           });
+        }
+      }
+    }
+
+    // Oracle: detect (+) old-style outer join syntax
+    if (this.dialect === 'oracle') {
+      const oracleJoinPattern = /\b(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)\s*\(\+\)/g;
+      while ((match = oracleJoinPattern.exec(sql)) !== null) {
+        const left = this.resolveAlias(match[1]);
+        const right = this.resolveAlias(match[3]);
+        if (left !== right && nodeMap.has(left) && nodeMap.has(right)) {
+          const exists = edges.some(e =>
+            (e.source === left && e.target === right) ||
+            (e.source === right && e.target === left)
+          );
+          if (!exists) {
+            edges.push({
+              source: left,
+              target: right,
+              type: 'join',
+              label: 'LEFT JOIN (+)',
+              condition: `${match[1]}.${match[2]} = ${match[3]}.${match[4]}(+)`
+            });
+          }
+        }
+      }
+      // Reverse direction: a.col(+) = b.col
+      const oracleJoinPattern2 = /\b(\w+)\.(\w+)\s*\(\+\)\s*=\s*(\w+)\.(\w+)\b/g;
+      while ((match = oracleJoinPattern2.exec(sql)) !== null) {
+        const left = this.resolveAlias(match[1]);
+        const right = this.resolveAlias(match[3]);
+        if (left !== right && nodeMap.has(left) && nodeMap.has(right)) {
+          const exists = edges.some(e =>
+            (e.source === left && e.target === right) ||
+            (e.source === right && e.target === left)
+          );
+          if (!exists) {
+            edges.push({
+              source: right,
+              target: left,
+              type: 'join',
+              label: 'LEFT JOIN (+)',
+              condition: `${match[1]}.${match[2]}(+) = ${match[3]}.${match[4]}`
+            });
+          }
         }
       }
     }
@@ -797,6 +978,10 @@ class SQLParser {
       'RECURSIVE', 'MATERIALIZED', 'REPLACE', 'TRUE', 'FALSE', 'TOP', 'MERGE',
       'MATCHED', 'FOR', 'IF', 'GRANT', 'REVOKE', 'PRIMARY', 'KEY', 'FOREIGN',
       'REFERENCES', 'CHECK', 'CONSTRAINT', 'DEFAULT', 'UNIQUE', 'TRIGGER',
+      // Dialect-specific keywords
+      'APPLY', 'CONNECT', 'START', 'PRIOR', 'MINUS', 'OPTION',
+      'STRAIGHT_JOIN', 'ILIKE', 'OUTPUT', 'PERCENT', 'TIES',
+      'NOLOCK', 'ROWLOCK', 'READUNCOMMITTED', 'FORCE', 'USE', 'IGNORE',
     ]);
     return kw.has(word);
   }

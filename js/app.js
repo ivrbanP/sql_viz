@@ -283,6 +283,20 @@ LIMIT 50 OFFSET 0;`
       }
     });
 
+    document.getElementById('sql-dialect').addEventListener('change', () => {
+      // Update CodeMirror SQL mode for syntax highlighting
+      const modeMap = {
+        'postgresql': 'text/x-pgsql',
+        'oracle': 'text/x-plsql',
+        'mysql': 'text/x-mysql',
+        'mssql': 'text/x-mssql',
+      };
+      const dialect = document.getElementById('sql-dialect').value;
+      editor.setOption('mode', modeMap[dialect] || 'text/x-sql');
+      // Re-visualize if there's content
+      if (editor.getValue().trim()) visualize();
+    });
+
     // Window resize
     window.addEventListener('resize', () => {
       if (diagram.svg) diagram.fitToView();
@@ -301,7 +315,8 @@ LIMIT 50 OFFSET 0;`
     }
 
     try {
-      const graph = parser.parse(sql);
+      const dialect = document.getElementById('sql-dialect').value;
+      const graph = parser.parse(sql, dialect);
 
       if (graph.nodes.length === 0) {
         diagram.showError('No tables found in the query');
