@@ -527,6 +527,51 @@ html, body {
   to   { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 
+/* ---- Stats Bar ---- */
+#stats-bar {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  padding: 6px 14px;
+  background: rgba(30, 31, 53, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 11px;
+  color: var(--text-muted);
+  z-index: 5;
+  pointer-events: none;
+}
+
+.stats-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-right: 1px solid var(--border);
+}
+
+.stats-item:last-child {
+  border-right: none;
+}
+
+.stats-icon {
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.stats-value {
+  font-weight: 700;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.stats-label {
+  opacity: 0.7;
+}
+
 /* ---- Legend ---- */
 #legend {
   position: absolute;

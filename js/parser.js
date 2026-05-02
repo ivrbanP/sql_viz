@@ -696,8 +696,18 @@ class SQLParser {
 
       if (i < tokens.length && (tokens[i].u === 'SELECT' || tokens[i].u === 'WITH')) {
         if (tokens[i].u === 'WITH') {
-          this.analyzeCTE(tokens.slice(i), nodeMap, edges, viewNode.id);
+          // CTE-backed view: columns come from the final SELECT inside the CTE
+          // analyzeCTE will route output to viewNode.id; extract columns from the
+          // main SELECT that follows the last CTE body.
+          const cteTokens = tokens.slice(i);
+          // Find the main SELECT position inside the CTE token slice
+          const mainSelectIdx = this._findCTEMainSelectIndex(cteTokens);
+          if (mainSelectIdx !== -1) {
+            viewNode.columns = this.extractSelectListColumns(cteTokens, mainSelectIdx, cteTokens.length);
+          }
+          this.analyzeCTE(cteTokens, nodeMap, edges, viewNode.id);
         } else {
+          viewNode.columns = this.extractSelectListColumns(tokens, i, tokens.length);
           this.analyzeSelect(tokens, i, tokens.length, nodeMap, edges, viewNode.id);
         }
       }
@@ -712,9 +722,36 @@ class SQLParser {
       while (i < tokens.length && tokens[i].u !== 'AS') i++;
       if (i < tokens.length) i++;
       if (i < tokens.length && tokens[i].u === 'SELECT') {
+        tableNode.columns = this.extractSelectListColumns(tokens, i, tokens.length);
         this.analyzeSelect(tokens, i, tokens.length, nodeMap, edges, tableNode.id);
       }
     }
+  }
+
+  // Find the index of the main SELECT (outside all CTE bodies) in a CTE token slice
+  _findCTEMainSelectIndex(tokens) {
+    let i = 0;
+    if (i < tokens.length && tokens[i].u === 'WITH') i++;
+    if (i < tokens.length && tokens[i].u === 'RECURSIVE') i++;
+    // Skip past each CTE name AS (body), …
+    while (i < tokens.length) {
+      if (!this.isIdentifier(tokens[i])) break;
+      i++; // CTE name
+      // Optional column list before AS
+      if (i < tokens.length && tokens[i].v === '(') {
+        const cp = this.findCloseParen(tokens, i);
+        if (cp + 1 < tokens.length && tokens[cp + 1].u === 'AS') i = cp + 1;
+      }
+      if (i < tokens.length && tokens[i].u === 'AS') i++;
+      if (i < tokens.length && tokens[i].u === 'NOT') i++;
+      if (i < tokens.length && tokens[i].u === 'MATERIALIZED') i++;
+      if (i < tokens.length && tokens[i].v === '(') {
+        i = this.findCloseParen(tokens, i) + 1;
+      }
+      if (i < tokens.length && tokens[i].v === ',') { i++; continue; }
+      break;
+    }
+    return (i < tokens.length && tokens[i].u === 'SELECT') ? i : -1;
   }
 
   // ── UPDATE ─────────────────────────────────────────────────────
@@ -847,6 +884,7 @@ class SQLParser {
         const cteNode = this.getOrCreateNode(nodeMap, cteName, 'cte');
         this.addAlias(cteName, cteName);
 
+        cteNode.columns = this.extractSelectListColumns(tokens, i + 1, cp);
         this.analyzeSelect(tokens, i + 1, cp, nodeMap, edges, cteNode.id);
 
         i = cp + 1;

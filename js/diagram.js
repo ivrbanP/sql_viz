@@ -110,6 +110,9 @@ class DiagramRenderer {
     // Fit to view
     this.fitToView();
 
+    // Add stats bar
+    this.addStatsBar(graph);
+
     // Add legend
     this.addLegend(graph);
   }
@@ -122,6 +125,9 @@ class DiagramRenderer {
     this.edgesG = null;
     this.nodePositions.clear();
     this.edgeData = [];
+    // Remove stats bar
+    const statsBar = document.getElementById('stats-bar');
+    if (statsBar) statsBar.remove();
     // Remove legend
     const legend = document.getElementById('legend');
     if (legend) legend.remove();
@@ -724,6 +730,39 @@ class DiagramRenderer {
     this.container.appendChild(banner);
 
     setTimeout(() => banner.remove(), 4000);
+  }
+
+  addStatsBar(graph) {
+    const existing = document.getElementById('stats-bar');
+    if (existing) existing.remove();
+
+    const tables  = graph.nodes.filter(n => n.type === 'table').length;
+    const views   = graph.nodes.filter(n => n.type === 'view').length;
+    const ctes    = graph.nodes.filter(n => n.type === 'cte').length;
+    const joins   = graph.edges.filter(e => e.type === 'join').length;
+    const wheres  = graph.nodes.reduce((s, n) => s + (n.filters || []).length, 0);
+    const resultNode = graph.nodes.find(n => n.type === 'result');
+    const resultCols = resultNode ? (resultNode.columns || []).length : null;
+
+    const stats = [];
+    if (tables)  stats.push({ icon: '⊞', label: 'Tables',      value: tables,      color: this.colors.table });
+    if (views)   stats.push({ icon: '◫', label: 'Views',       value: views,       color: this.colors.view });
+    if (ctes)    stats.push({ icon: '⊞', label: 'CTEs',        value: ctes,        color: this.colors.cte });
+    if (joins)   stats.push({ icon: '⇄', label: 'Joins',       value: joins,       color: '#7a8aaa' });
+    if (wheres)  stats.push({ icon: '▸', label: 'Filters',     value: wheres,      color: '#f0c040' });
+    if (resultCols !== null) stats.push({ icon: '⊳', label: 'Output cols', value: resultCols, color: this.colors.result });
+
+    const bar = document.createElement('div');
+    bar.id = 'stats-bar';
+
+    for (const s of stats) {
+      const el = document.createElement('div');
+      el.className = 'stats-item';
+      el.innerHTML = `<span class="stats-icon" style="color:${s.color}">${s.icon}</span><span class="stats-value">${s.value}</span><span class="stats-label">${s.label}</span>`;
+      bar.appendChild(el);
+    }
+
+    this.container.appendChild(bar);
   }
 
   addLegend(graph) {
