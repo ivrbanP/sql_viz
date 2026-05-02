@@ -191,7 +191,9 @@ class SQLParser {
     if (first === 'WITH') {
       this.analyzeCTE(tokens, nodeMap, edges);
     } else if (first === 'SELECT') {
-      this.analyzeSelect(tokens, 0, tokens.length, nodeMap, edges, null);
+      const resultNode = this.getOrCreateNode(nodeMap, 'Query Result', 'result');
+      resultNode.columns = this.extractSelectListColumns(tokens, 0, tokens.length);
+      this.analyzeSelect(tokens, 0, tokens.length, nodeMap, edges, resultNode.id);
     } else if (first === 'INSERT') {
       this.analyzeInsert(tokens, nodeMap, edges);
     } else if (first === 'CREATE') {
@@ -327,6 +329,8 @@ class SQLParser {
     let i = fromPos + 1;
     let prevTable = null;
     const sourceTableIds = new Set();
+    // Track which tables already have an edge to targetId (to avoid duplicates)
+    const tablesWithTargetEdge = new Set();
 
     while (i < fromEnd) {
       if (tokens[i].v === ',') { i++; continue; }
@@ -345,22 +349,43 @@ class SQLParser {
           i = cond.nextPos;
 
           if (prevTable) {
-            // Determine actual join source from ON condition
-            let actualSource = prevTable.id;
-            if (cond.text) {
-              const refs = [...cond.text.matchAll(/\b(\w+)\s*\./g)].map(m => this.resolveAlias(m[1]));
-              const newId = result.node.id.toLowerCase();
-              const sourceRef = refs.find(r => r !== newId && sourceTableIds.has(r));
-              if (sourceRef) actualSource = sourceRef;
+            if (targetId) {
+              // Hub model: all joined tables point directly to the result/target node
+              if (!tablesWithTargetEdge.has(prevTable.id)) {
+                edges.push({
+                  source: prevTable.id,
+                  target: targetId,
+                  type: 'join',
+                  label: '',
+                  condition: ''
+                });
+                tablesWithTargetEdge.add(prevTable.id);
+              }
+              edges.push({
+                source: result.node.id,
+                target: targetId,
+                type: 'join',
+                label: joinMatch.type,
+                condition: cond.text
+              });
+              tablesWithTargetEdge.add(result.node.id);
+            } else {
+              // Chain model (no result node): prevTable -> joinedTable
+              let actualSource = prevTable.id;
+              if (cond.text) {
+                const refs = [...cond.text.matchAll(/\b(\w+)\s*\./g)].map(m => this.resolveAlias(m[1]));
+                const newId = result.node.id.toLowerCase();
+                const sourceRef = refs.find(r => r !== newId && sourceTableIds.has(r));
+                if (sourceRef) actualSource = sourceRef;
+              }
+              edges.push({
+                source: actualSource,
+                target: result.node.id,
+                type: 'join',
+                label: joinMatch.type,
+                condition: cond.text
+              });
             }
-
-            edges.push({
-              source: actualSource,
-              target: result.node.id,
-              type: 'join',
-              label: joinMatch.type,
-              condition: cond.text
-            });
           }
           sourceTableIds.add(result.node.id.toLowerCase());
           prevTable = result.node;
@@ -386,16 +411,18 @@ class SQLParser {
     this.scanSubqueries(tokens, start, fromPos, nodeMap, edges);
     this.scanSubqueries(tokens, fromEnd, end, nodeMap, edges);
 
-    // Data flow edges to target
+    // Data flow edges to target for tables not already connected via join edges
     if (targetId) {
       for (const table of sourceTables) {
-        edges.push({
-          source: table.id,
-          target: targetId,
-          type: 'data_flow',
-          label: '',
-          condition: ''
-        });
+        if (!tablesWithTargetEdge.has(table.id)) {
+          edges.push({
+            source: table.id,
+            target: targetId,
+            type: 'data_flow',
+            label: '',
+            condition: ''
+          });
+        }
       }
     }
 
@@ -878,12 +905,24 @@ class SQLParser {
 
       if (left !== right && nodeMap.has(left) && nodeMap.has(right)) {
         // Check if a join edge already exists between these two
-        const exists = edges.some(e =>
+        const directExists = edges.some(e =>
           (e.type === 'join' || e.type === 'where_join') && (
             (e.source === left && e.target === right) ||
             (e.source === right && e.target === left)
           )
         );
+
+        // Also check hub model: both tables already share a common target
+        const leftTargets = new Set(
+          edges
+            .filter(e => e.source === left && (e.type === 'join' || e.type === 'data_flow'))
+            .map(e => e.target)
+        );
+        const hubExists = edges.some(
+          e => e.source === right && (e.type === 'join' || e.type === 'data_flow') && leftTargets.has(e.target)
+        );
+
+        const exists = directExists || hubExists;
 
         if (!exists) {
           edges.push({
